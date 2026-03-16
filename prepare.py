@@ -24,7 +24,10 @@ import rustbpe
 import tiktoken
 import torch
 
-from accelerator import autodetect_device_type, get_device
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -312,7 +315,9 @@ def get_token_bytes(device="cpu"):
 
 def resolve_runtime_device(device=None):
     if device is None:
-        return get_device(autodetect_device_type())
+        if torch_npu is None:
+            raise RuntimeError("This repository is Ascend-only and requires torch_npu/CANN.")
+        return torch.device("npu")
     return torch.device(device)
 
 
@@ -352,7 +357,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None):
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     epoch = 1
-    use_pinned_memory = device.type == "cuda"
+    use_pinned_memory = False
 
     def refill_buffer():
         nonlocal epoch

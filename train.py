@@ -1,5 +1,5 @@
 """
-Autoresearch pretraining script. Single-accelerator, single-file.
+Autoresearch pretraining script. Single-NPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: python train.py
 """
@@ -17,18 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from accelerator import (
-    autodetect_device_type,
-    get_device,
-    get_device_name,
-    get_max_memory_allocated,
-    get_peak_flops,
-    get_synchronize,
-    make_autocast_context,
-    maybe_set_matmul_precision,
-    seed_all,
-)
-from flash_attention import HAS_FA3, flash_attn_func
+try:
+    import torch_npu  # noqa: F401
+except ImportError as exc:
+    raise RuntimeError("This repository is Ascend-only and requires torch_npu/CANN.") from exc
+
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
@@ -62,6 +55,38 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+def _sdpa_attention(q, k, v, window_size, enable_gqa):
+    """
+    SDPA attention with optional sliding-window masking.
+    Inputs are in (B, H, T, D) format.
+    """
+    tq = q.size(2)
+    tk = k.size(2)
+    window = window_size[0]
+
+    if (window < 0 or window >= tq) and tq == tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+
+    device = q.device
+    row_idx = (tk - tq) + torch.arange(tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+
+
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+    if not causal:
+        raise ValueError("Only causal attention is supported.")
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    return y.transpose(1, 2)
 
 
 class CausalSelfAttention(nn.Module):
@@ -181,8 +206,8 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16 on accelerators that handle it well.
-        if self.transformer.wte.weight.device.type in ["cuda", "npu"]:
+        # Cast embeddings to bf16 on Ascend NPU.
+        if self.transformer.wte.weight.device.type == "npu":
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
@@ -195,7 +220,7 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        compute_dtype = torch.bfloat16 if device.type in ["cuda", "npu"] else torch.float32
+        compute_dtype = torch.bfloat16 if device.type == "npu" else torch.float32
         cos, sin = cos.to(dtype=compute_dtype), sin.to(dtype=compute_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
@@ -299,7 +324,7 @@ class GPT(nn.Module):
         return logits
 
 # ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single accelerator only)
+# Optimizer (MuonAdamW, single NPU only)
 # ---------------------------------------------------------------------------
 
 polar_express_coeffs = [
@@ -478,23 +503,24 @@ DEVICE_BATCH_SIZE = 64  # per-device batch size (reduce if OOM)
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-device_type = autodetect_device_type()
-seed_all(42, device_type)
-maybe_set_matmul_precision()
-device = get_device(device_type)
-autocast_ctx = make_autocast_context(device_type)
-synchronize = get_synchronize(device_type)
-get_max_memory = get_max_memory_allocated(device_type)
-device_name = get_device_name(device_type)
-peak_flops = get_peak_flops(device_name)
+torch.manual_seed(42)
+torch.npu.manual_seed(42)
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
-print(f"Autodetected device type: {device_type}")
-if device_type in ["cuda", "npu"]:
-    print(f"Device: {device_name}")
-if not HAS_FA3:
-    print("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    if WINDOW_PATTERN != "L":
-        print(f"WARNING: window_pattern='{WINDOW_PATTERN}' may be slow without FA3; consider 'L' on Ascend.")
+device = torch.device("npu")
+torch.npu.set_device(device)
+autocast_ctx = torch.amp.autocast(device_type="npu", dtype=torch.bfloat16)
+synchronize = torch.npu.synchronize
+get_max_memory = torch.npu.max_memory_allocated
+device_name = torch.npu.get_device_name(0)
+peak_flops = 313e12  # Ascend 910B BF16 peak FLOPS
+
+print("Device type: npu")
+print(f"Device: {device_name}")
+print("Using SDPA attention path on Ascend.")
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -539,10 +565,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-if device_type == "cuda":
-    model = torch.compile(model, dynamic=False)
-else:
-    print("torch.compile disabled on this device type for compatibility.")
+print("torch.compile disabled on Ascend for compatibility.")
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train", device=device)
 x, y, epoch = next(train_loader)  # prefetch first batch

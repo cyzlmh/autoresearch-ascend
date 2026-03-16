@@ -1,36 +1,40 @@
 # autoresearch-ascend
 
-Ascend-focused fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
+Ascend-only fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
-This repository keeps the original small, single-file training workflow, but adapts runtime behavior so it can run on Huawei Ascend (`torch_npu` / CANN) environments.
+This repo keeps the original autoresearch workflow (`program.md` drives the agent, agent edits `train.py`) and adapts runtime code for Huawei Ascend (`torch_npu` / CANN).
 
-## Upstream baseline
+## 3-file core
 
-- Base project: `karpathy/autoresearch`
-- Core loop preserved: fixed 5-minute training budget, `train.py` as the main research surface
+The research loop is intentionally centered on three files:
 
-## What was modified for Ascend
+- `prepare.py` (data prep + tokenizer + fixed evaluation)
+- `train.py` (model/optimizer/training loop; the file agents iterate on)
+- `program.md` (human-authored research instructions)
 
-| File | Change |
-| --- | --- |
-| `accelerator.py` | Added backend abstraction for `cuda` / `npu` / `mps` / `cpu` (device selection, seed, autocast, sync, memory metric, peak FLOPS lookup). |
-| `flash_attention.py` | Added Flash Attention compatibility shim: FA3 on CUDA when available, SDPA fallback for non-CUDA (including Ascend). |
-| `train.py` | Reworked runtime calls to use accelerator helpers instead of CUDA-only APIs; non-CUDA-safe `torch.compile` handling; NPU-compatible memory/sync reporting. |
-| `prepare.py` | Added dataset download endpoint controls (`HF_ENDPOINT`, `AUTORESEARCH_DATA_BASE_URL`) and retry behavior improvements. |
-| `pyproject.toml` | Project metadata updated for Ascend fork and dependencies aligned with this runtime layout. |
-| `README.md` | Rewritten to document Ascend-specific behavior and usage. |
+## What changed for Ascend
 
-## Ascend environment requirements
+Compared with upstream `karpathy/autoresearch`, this fork makes these practical changes:
 
-- Python `>=3.10`
-- PyTorch installed for your Ascend environment
-- `torch_npu` + CANN already configured and validated
-- Dependencies from `pyproject.toml` installed into the same environment
+1. `train.py` is Ascend-only runtime:
+   - uses `torch.npu` device setup, seed, sync, and memory stats
+   - uses BF16 autocast on NPU
+   - keeps `torch.compile` disabled for Ascend compatibility
+2. `train.py` attention path uses in-file SDPA (windowed causal masking) instead of CUDA FlashAttention kernels.
+3. `prepare.py` supports mirror-friendly dataset download configuration:
+   - `HF_ENDPOINT`
+   - `AUTORESEARCH_DATA_BASE_URL`
+   - `AUTORESEARCH_CACHE_DIR`
+4. Removed extra compatibility helper modules; logic is kept in core files.
 
-Example dependency install (inside your active Ascend env):
+## Requirements
+
+- Python >= 3.10
+- Ascend environment with `torch_npu` + CANN working
+- Python deps (in the same environment):
 
 ```bash
-pip install matplotlib numpy pandas pyarrow requests rustbpe tiktoken kernels
+pip install matplotlib numpy pandas pyarrow requests rustbpe tiktoken
 ```
 
 ## Quick start
@@ -43,32 +47,24 @@ python prepare.py
 python train.py
 ```
 
-## Dataset download configuration
+## Download endpoint options
 
-`prepare.py` supports these optional env vars:
+Use these only if default Hugging Face access is blocked/slow:
 
 - `AUTORESEARCH_CACHE_DIR=/path/to/cache`
 - `HF_ENDPOINT=https://hf-mirror.com`
 - `AUTORESEARCH_DATA_BASE_URL=https://<host>/datasets/karpathy/climbmix-400b-shuffle/resolve/main`
 
-If `AUTORESEARCH_DATA_BASE_URL` is set, it is used directly.
-Otherwise, `HF_ENDPOINT` is used as endpoint prefix.
+`AUTORESEARCH_DATA_BASE_URL` has highest priority when set.
 
-## Ascend tuning knobs (manual edits)
+## NPU tuning knobs (manual)
 
-For this fork, `DEVICE_BATCH_SIZE` is intentionally a manual knob in `train.py`.
+Edit directly in `train.py`:
 
-If you hit OOM on 910B-class NPUs, edit these in `train.py` and rerun:
-
-- `DEVICE_BATCH_SIZE` (first knob to lower)
-- `WINDOW_PATTERN` (often use `"L"` on Ascend)
+- `DEVICE_BATCH_SIZE` (first OOM knob)
+- `WINDOW_PATTERN` (`"L"` is often safer/faster on Ascend)
 - `DEPTH`
-- `TOTAL_BATCH_SIZE` (must remain divisible by `DEVICE_BATCH_SIZE * MAX_SEQ_LEN`)
-
-## Scope and non-goals
-
-- Goal: keep a minimal fork that runs the autoresearch loop on Ascend.
-- Non-goal: rebuild full `nanochat`-style multi-script infrastructure.
+- `TOTAL_BATCH_SIZE` (must stay divisible by `DEVICE_BATCH_SIZE * MAX_SEQ_LEN`)
 
 ## License
 
