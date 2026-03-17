@@ -66,6 +66,42 @@ Edit directly in `train.py`:
 - `DEPTH`
 - `TOTAL_BATCH_SIZE` (must stay divisible by `DEVICE_BATCH_SIZE * MAX_SEQ_LEN`)
 
+## One-night result (2026-03-16)
+
+Run branch: `autoresearch/mar16b`  
+Total experiments: `43`
+
+- Baseline `val_bpb`: `1.3843`
+- Best `val_bpb`: `1.1583` (`1.158260` run), about `16.3%` lower than baseline
+- Peak memory: `9.1 GB` (from `50.1 GB`, about `82%` reduction)
+
+Best configuration from the run:
+
+```python
+ASPECT_RATIO = 56
+HEAD_DIM = 128
+WINDOW_PATTERN = "L"
+DEPTH = 6
+DEVICE_BATCH_SIZE = 16
+TOTAL_BATCH_SIZE = 2**17
+WEIGHT_DECAY = 0.5
+WARMDOWN_RATIO = 0.1
+WARMUP_RATIO = 0.0
+MATRIX_LR = 0.02
+EMBEDDING_LR = 0.5
+SCALAR_LR = 0.5
+```
+
+Key findings:
+
+1. `WINDOW_PATTERN="L"` performed better than sliding-window patterns on this Ascend setup.
+2. Smaller device batch size with more optimizer updates in fixed time improved convergence.
+3. `DEPTH=6` gave a better speed/quality tradeoff under the 5-minute budget.
+4. Higher weight decay (`0.5`) regularized well for this regime.
+5. Short warmdown (`0.1`) helped keep more training time near peak LR.
+6. Lower `MATRIX_LR` (`0.02`) and `EMBEDDING_LR` (`0.5`) improved stability.
+7. `ASPECT_RATIO=56` was the best capacity/speed balance among tested values.
+
 ## License
 
 MIT
